@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+git branch -D stack-1 stack-2 stack-3
+git push origin -d stack-1 stack-2 stack-3
+
+git switch main
+git reset --hard a9e08249abd6265936ad2637be32dc5febfa7de0
+git push -u origin main -f
+
+git switch -c stack-1
+echo "foo" >> README.md
+git commit README.md -m "foo"
+git push -u origin stack-1 -f
+gh pr create --base main --title foo --body ''
+
+git switch -c stack-2
+echo "bar" >> README.md
+git commit README.md -m "bar"
+git push -u origin stack-2 -f
+gh pr create --base stack-1 --title bar --body ''
+
+git switch -c stack-3
+echo "baz" >> README.md
+git commit README.md -m "baz"
+git push -u origin stack-3 -f
+gh pr create --base stack-2 --title baz --body ''
+
