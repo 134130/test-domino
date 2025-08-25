@@ -1,2 +1,3 @@
 # test-domino
 aaa
+foo
