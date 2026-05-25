@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE="${REMOTE:-origin}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+RUN_ID="${DOMINO_RUN_ID:-$(date +%Y%m%d%H%M%S)}"
+BRANCH_PREFIX="${DOMINO_BRANCH_PREFIX:-}"
+RESET_BRANCH="${DOMINO_RESET_BRANCH:-test-domino-reset}"
+SCENARIO="${1:-basic}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+MANIFEST_FILE="${TMPDIR:-/tmp}/test-domino-manifest-${RUN_ID}-$$.tsv"
+PRESERVE_DIR=""
+
+cd "$REPO_ROOT"
+
+cleanup() {
+  if [[ -n "$PRESERVE_DIR" ]]; then
+    rm -rf "$PRESERVE_DIR"
+  fi
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./init [basic|merged|diverged|projection|conflict|all]
+
+Scenarios:
+  basic       Clean tree for TUI navigation and selection modes.
+  merged      Merge method matrix: merge commit, squash merge, rebase merge.
+  diverged    Child PR whose parent branch moved after the child was created.
+  projection  Parent repair candidate with a currently clean descendant.
+  conflict    Repair candidate that should fail with a rebase conflict.
+  all         Build every scenario in one repository reset.
+
+Environment:
+  REMOTE                 Git remote to push to. Defaults to origin.
+  DEFAULT_BRANCH         Default branch to reset and target. Defaults to main.
+  DOMINO_RUN_ID          Manifest suffix. Defaults to timestamp.
+  DOMINO_BRANCH_PREFIX   Optional branch prefix override. When set, generated
+                         branches use ${DOMINO_BRANCH_PREFIX}-<logical-id>.
+EOF
+}
+
+log() {
+  printf '==> %s\n' "$*"
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+branch_for() {
+  if [[ -n "$BRANCH_PREFIX" ]]; then
+    printf '%s-%s' "$BRANCH_PREFIX" "$1"
+    return
+  fi
+
+  case "$1" in
+  100 | 110 | 111 | 200 | 210 | 211 | 212 | 220 | 221)
+    printf 'stack-%s' "$1"
+    ;;
+  M100) printf 'feature-a__' ;;
+  M110) printf 'feature-aa_' ;;
+  S100) printf 'feature-b__' ;;
+  S110) printf 'feature-ba_' ;;
+  R100) printf 'feature-c__' ;;
+  R110) printf 'feature-ca_' ;;
+  D100) printf 'feature-d__' ;;
+  D110) printf 'feature-da_' ;;
+  P000) printf 'feature-e__' ;;
+  P100) printf 'feature-ea_' ;;
+  P110) printf 'feature-eaa' ;;
+  C000) printf 'feature-f__' ;;
+  C100) printf 'feature-fa_' ;;
+  *)
+    die "no readable branch mapping for logical id: $1"
+    ;;
+  esac
+}
+
+base_ref() {
+  if [[ "$1" == "$DEFAULT_BRANCH" || "$1" == "main" ]]; then
+    printf '%s' "$DEFAULT_BRANCH"
+    return
+  fi
+  branch_for "$1"
+}
+
+record_manifest() {
+  local id="$1"
+  local branch="$2"
+  local base="$3"
+  local url="$4"
+  local expected="$5"
+
+  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$branch" "$base" "$url" "$expected" >>"$MANIFEST_FILE"
+}
+
+print_manifest() {
+  printf '\nFixture manifest\n'
+  printf '  scenario: %s\n' "$SCENARIO"
+  if [[ -n "$BRANCH_PREFIX" ]]; then
+    printf '  branch naming: %s-<logical-id>\n\n' "$BRANCH_PREFIX"
+  else
+    printf '  branch naming: readable defaults (stack-*/feature-*)\n\n'
+  fi
+
+  if [[ ! -s "$MANIFEST_FILE" ]]; then
+    printf '  No PRs created.\n'
+    return
+  fi
+
+  while IFS=$'\t' read -r id branch base url expected; do
+    printf '  %-6s %-36s base=%-36s %s\n' "$id" "$branch" "$base" "$url"
+    printf '         expected: %s\n' "$expected"
+  done <"$MANIFEST_FILE"
+}
+
+require_tools() {
+  command -v git >/dev/null || die "git is required"
+  command -v gh >/dev/null || die "GitHub CLI (gh) is required"
+}
+
+validate_scenario() {
+  case "$SCENARIO" in
+  basic | merged | diverged | projection | conflict | all)
+    return 0
+    ;;
+  *)
+    usage
+    die "unknown scenario: $SCENARIO"
+    ;;
+  esac
+}
+
+require_safe_worktree() {
+  local dirty=0
+  local line
+  local path
+
+  while IFS= read -r line; do
+    path="${line:3}"
+    case "$path" in
+    README.md | init)
+      ;;
+    *)
+      printf 'dirty path blocks fixture reset: %s\n' "$line" >&2
+      dirty=1
+      ;;
+    esac
+  done < <(git status --porcelain)
+
+  if [[ "$dirty" -ne 0 ]]; then
+    die "commit, stash, or remove non-fixture changes before running ./init"
+  fi
+}
+
+preserve_baseline_files() {
+  PRESERVE_DIR="$(mktemp -d)"
+
+  if [[ -f README.md ]]; then
+    cp README.md "$PRESERVE_DIR/README.md"
+  else
+    printf '# test-domino\n' >"$PRESERVE_DIR/README.md"
+  fi
+
+  cp "$SCRIPT_PATH" "$PRESERVE_DIR/init"
+  chmod +x "$PRESERVE_DIR/init"
+}
+
+close_fixture_prs() {
+  log "Closing open fixture PRs"
+  gh pr list --state open --limit 300 --json number,headRefName \
+    --jq '.[] | select((.headRefName | startswith("domino-")) or (.headRefName | startswith("stack-")) or (.headRefName | startswith("feature-"))) | .number' |
+    while IFS= read -r number; do
+      [[ -z "$number" ]] && continue
+      gh pr close "$number" --delete-branch || true
+    done
+}
+
+delete_local_fixture_branches() {
+  log "Deleting local fixture branches"
+  git for-each-ref --format='%(refname:short)' \
+    'refs/heads/domino-*' \
+    'refs/heads/stack-*' \
+    'refs/heads/feature-*' |
+    while IFS= read -r branch; do
+      [[ -z "$branch" ]] && continue
+      git branch -D "$branch" || true
+    done
+}
+
+delete_remote_fixture_branches() {
+  log "Deleting remote fixture branches"
+  git ls-remote --heads "$REMOTE" 'domino-*' 'stack-*' 'feature-*' |
+    while IFS=$'\t' read -r _ ref; do
+      branch="${ref#refs/heads/}"
+      [[ -z "$branch" ]] && continue
+      git push "$REMOTE" ":$branch" || true
+    done
+}
+
+switch_default_branch() {
+  if git switch "$DEFAULT_BRANCH" >/dev/null 2>&1; then
+    return
+  fi
+  git switch -c "$DEFAULT_BRANCH" "$REMOTE/$DEFAULT_BRANCH"
+}
+
+reset_fixture_refs() {
+  git fetch "$REMOTE" --prune
+  switch_default_branch
+  close_fixture_prs
+  delete_local_fixture_branches
+  delete_remote_fixture_branches
+}
+
+clear_worktree_except_git() {
+  local path
+
+  shopt -s dotglob nullglob
+  for path in *; do
+    [[ "$path" == ".git" ]] && continue
+    rm -rf -- "$path"
+  done
+  shopt -u dotglob nullglob
+}
+
+reset_main() {
+  local reset_branch="$RESET_BRANCH"
+
+  log "Resetting $DEFAULT_BRANCH to a fresh fixture root"
+  git branch -D "$reset_branch" >/dev/null 2>&1 || true
+  git switch --orphan "$reset_branch"
+  git rm -r --cached . >/dev/null 2>&1 || true
+  clear_worktree_except_git
+  cp "$PRESERVE_DIR/README.md" README.md
+  cp "$PRESERVE_DIR/init" init
+  chmod +x init
+  git add README.md init
+  git commit -m "Reset test-domino fixture baseline"
+  git branch -M "$DEFAULT_BRANCH"
+  git push -u "$REMOTE" "$DEFAULT_BRANCH" -f
+}
+
+commit_file() {
+  local file="$1"
+  local content="$2"
+  local message="$3"
+
+  mkdir -p "$(dirname "$file")"
+  printf '%s\n' "$content" >"$file"
+  git add "$file"
+  git commit -m "$message"
+}
+
+push_branch() {
+  local branch="$1"
+  git push -u "$REMOTE" "$branch" -f
+}
+
+open_pr() {
+  local id="$1"
+  local base_id="$2"
+  local title="$3"
+  local expected="$4"
+  local branch
+  local base_branch
+  local body
+  local url
+
+  branch="$(branch_for "$id")"
+  base_branch="$(base_ref "$base_id")"
+  body="$(printf 'Fixture scenario: %s\nLogical id: %s\nExpected: %s\n' "$SCENARIO" "$id" "$expected")"
+
+  url="$(gh pr create --base "$base_branch" --head "$branch" --title "[$id] $title" --body "$body")"
+  record_manifest "$id" "$branch" "$base_branch" "$url" "$expected"
+}
+
+create_pr() {
+  local id="$1"
+  local base_id="$2"
+  local title="$3"
+  local file="$4"
+  local content="$5"
+  local expected="$6"
+  local branch
+  local base_branch
+
+  branch="$(branch_for "$id")"
+  base_branch="$(base_ref "$base_id")"
+
+  log "Creating [$id] $branch -> $base_branch"
+  git switch -C "$branch" "$base_branch"
+  commit_file "$file" "$content" "[$id] $title"
+  push_branch "$branch"
+  open_pr "$id" "$base_id" "$title" "$expected"
+}
+
+create_pr_two_commits() {
+  local id="$1"
+  local base_id="$2"
+  local title="$3"
+  local file="$4"
+  local first_content="$5"
+  local second_content="$6"
+  local expected="$7"
+  local branch
+  local base_branch
+
+  branch="$(branch_for "$id")"
+  base_branch="$(base_ref "$base_id")"
+
+  log "Creating [$id] $branch -> $base_branch"
+  git switch -C "$branch" "$base_branch"
+  commit_file "$file" "$first_content" "[$id] $title part 1"
+  commit_file "$file" "$second_content" "[$id] $title part 2"
+  push_branch "$branch"
+  open_pr "$id" "$base_id" "$title" "$expected"
+}
+
+force_update_branch() {
+  local id="$1"
+  local file="$2"
+  local content="$3"
+  local message="$4"
+  local branch
+
+  branch="$(branch_for "$id")"
+  log "Updating [$id] $branch after children exist"
+  git switch "$branch"
+  commit_file "$file" "$content" "[$id] $message"
+  push_branch "$branch"
+}
+
+merge_fixture_pr() {
+  local id="$1"
+  local method="$2"
+  local branch
+  local flag
+
+  branch="$(branch_for "$id")"
+  case "$method" in
+  merge) flag="--merge" ;;
+  squash) flag="--squash" ;;
+  rebase) flag="--rebase" ;;
+  *) die "unsupported merge method: $method" ;;
+  esac
+
+  log "Merging [$id] with $method"
+  if [[ "$method" == "rebase" ]]; then
+    gh pr merge "$branch" "$flag"
+  else
+    gh pr merge "$branch" "$flag" --subject "[$id] merged fixture parent"
+  fi
+  git switch "$DEFAULT_BRANCH"
+  git pull --ff-only "$REMOTE" "$DEFAULT_BRANCH"
+}
+
+create_basic() {
+  create_pr 100 main "basic root 100" fixtures/basic/100.txt \
+    "basic 100 root" "clean root"
+  create_pr 110 100 "basic child 110" fixtures/basic/110.txt \
+    "basic 110 child" "clean child of 100"
+  create_pr 111 110 "basic child 111" fixtures/basic/111.txt \
+    "basic 111 child" "clean child of 110"
+
+  create_pr 200 main "basic root 200" fixtures/basic/200.txt \
+    "basic 200 root" "clean root"
+  create_pr 210 200 "basic child 210" fixtures/basic/210.txt \
+    "basic 210 child" "clean child of 200"
+  create_pr 211 210 "basic child 211" fixtures/basic/211.txt \
+    "basic 211 child" "clean child of 210"
+  create_pr 212 210 "basic child 212" fixtures/basic/212.txt \
+    "basic 212 child" "clean child of 210"
+  create_pr 220 200 "basic child 220" fixtures/basic/220.txt \
+    "basic 220 child" "clean child of 200"
+  create_pr 221 220 "basic child 221" fixtures/basic/221.txt \
+    "basic 221 child" "clean child of 220"
+}
+
+prepare_merged() {
+  create_pr_two_commits M100 main "merge-commit parent" fixtures/merged/M100.txt \
+    "M100 parent commit 1" \
+    $'M100 parent commit 1\nM100 parent commit 2' \
+    "merged parent via merge commit"
+  create_pr M110 M100 "child of merge-commit parent" fixtures/merged/M110.txt \
+    "M110 child commit" "expect merged_base after M100 is merged with a merge commit"
+
+  create_pr_two_commits S100 main "squash parent" fixtures/merged/S100.txt \
+    "S100 parent commit 1" \
+    $'S100 parent commit 1\nS100 parent commit 2' \
+    "merged parent via squash"
+  create_pr S110 S100 "child of squash parent" fixtures/merged/S110.txt \
+    "S110 child commit" "expect merged_base with upstream after S100 is squash-merged"
+
+  create_pr_two_commits R100 main "rebase-merge parent" fixtures/merged/R100.txt \
+    "R100 parent commit 1" \
+    $'R100 parent commit 1\nR100 parent commit 2' \
+    "merged parent via rebase merge"
+  create_pr R110 R100 "child of rebase-merge parent" fixtures/merged/R110.txt \
+    "R110 child commit" "expect merged_base; upstream depends on GitHub rebase ancestry"
+}
+
+finish_merged() {
+  merge_fixture_pr M100 merge
+  merge_fixture_pr S100 squash
+  merge_fixture_pr R100 rebase
+}
+
+create_diverged() {
+  create_pr D100 main "diverged parent" fixtures/diverged/D100.txt \
+    "D100 parent before child" "clean parent that will be updated after child creation"
+  create_pr D110 D100 "child of diverged parent" fixtures/diverged/D110.txt \
+    "D110 child commit" "expect parent_diverged after D100 is updated"
+  force_update_branch D100 fixtures/diverged/D100.txt \
+    $'D100 parent before child\nD100 parent changed after child' \
+    "parent changed after child"
+}
+
+prepare_projection() {
+  create_pr P000 main "projection merged base" fixtures/projection/P000.txt \
+    "P000 merged base" "merged parent used to make P100 repairable"
+  create_pr P100 P000 "projection parent repair candidate" fixtures/projection/P100.txt \
+    "P100 parent commit" "expect merged_base after P000 is merged"
+  create_pr P110 P100 "projection clean descendant" fixtures/projection/P110.txt \
+    "P110 child commit" "child alone has no action; parent selection projects after parent repair"
+}
+
+finish_projection() {
+  merge_fixture_pr P000 merge
+}
+
+prepare_conflict() {
+  create_pr C000 main "conflict merged base" fixtures/conflict/shared.txt \
+    "parent line" "merged parent used to make C100 repairable"
+  create_pr C100 C000 "conflicting child repair" fixtures/conflict/shared.txt \
+    "child line" "expect rebase conflict after main edits the same line"
+}
+
+finish_conflict() {
+  merge_fixture_pr C000 merge
+  log "Adding conflicting main commit for C100"
+  git switch "$DEFAULT_BRANCH"
+  commit_file fixtures/conflict/shared.txt "main line" "[CMAIN] conflicting main update"
+  git push "$REMOTE" "$DEFAULT_BRANCH"
+  record_manifest CMAIN "$DEFAULT_BRANCH" "$DEFAULT_BRANCH" "" "main has conflicting line for C100 repair"
+}
+
+run_scenario() {
+  case "$SCENARIO" in
+  basic)
+    create_basic
+    ;;
+  merged)
+    prepare_merged
+    finish_merged
+    ;;
+  diverged)
+    create_diverged
+    ;;
+  projection)
+    prepare_projection
+    finish_projection
+    ;;
+  conflict)
+    prepare_conflict
+    finish_conflict
+    ;;
+  all)
+    create_basic
+    create_diverged
+    prepare_merged
+    prepare_projection
+    prepare_conflict
+    finish_projection
+    finish_merged
+    finish_conflict
+    ;;
+  esac
+}
+
+main() {
+  case "$SCENARIO" in
+  -h | --help | help)
+    usage
+    return 0
+    ;;
+  esac
+
+  validate_scenario
+  require_tools
+  require_safe_worktree
+  preserve_baseline_files
+  reset_fixture_refs
+  reset_main
+  run_scenario
+  git switch "$DEFAULT_BRANCH" >/dev/null
+  print_manifest
+}
+
+main "$@"
